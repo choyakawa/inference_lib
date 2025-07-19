@@ -19,6 +19,13 @@ template cudaError_t v21::hogwild_paged_attention_gpu<float>(
     const float* key_cache, const float* value_cache, const int* block_table,
     Shape shape
 );
+template cudaError_t v21::hogwild_varlen_paged_attention_gpu<float>(
+    float* out, float scale,
+    const int* locations, const float* queries,
+    const int* fragment_lengths,
+    const float* key_cache, const float* value_cache, const int* block_table,
+    Shape shape
+);
 #endif
 
 #ifdef HOGDILD_ENABLE_HALF
@@ -37,6 +44,13 @@ template cudaError_t v21::hogwild_paged_attention_gpu<half>(
     const half* key_cache, const half* value_cache, const int* block_table,
     Shape shape
 );
+template cudaError_t v21::hogwild_varlen_paged_attention_gpu<half>(
+    half* out, float scale,
+    const int* locations, const half* queries,
+    const int* fragment_lengths,
+    const half* key_cache, const half* value_cache, const int* block_table,
+    Shape shape
+);
 #endif
 
 #ifdef HOGDILD_ENABLE_BFLOAT
@@ -49,6 +63,13 @@ template cudaError_t v21::hogwild_attention_gpu<nv_bfloat16>(
     Shape shape
 );
 template cudaError_t v21::hogwild_paged_attention_gpu<nv_bfloat16>(
+    nv_bfloat16* out, float scale,
+    const int* locations, const nv_bfloat16* queries,
+    const int* fragment_lengths,
+    const nv_bfloat16* key_cache, const nv_bfloat16* value_cache, const int* block_table,
+    Shape shape
+);
+template cudaError_t v21::hogwild_varlen_paged_attention_gpu<nv_bfloat16>(
     nv_bfloat16* out, float scale,
     const int* locations, const nv_bfloat16* queries,
     const int* fragment_lengths,
