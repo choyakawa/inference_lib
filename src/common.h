@@ -13,7 +13,4 @@ struct Shape {
     // --- paged attention ---
     int block_size;
     int max_blocks_per_seq;
-    // --- varlen prefill ---
-    const int* cu_seqlens_q;
-    const int* cu_seqlens_k;
 };

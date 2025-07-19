@@ -30,7 +30,7 @@ scalar_t* torch_get_pointer(at::Tensor& tensor) {
     } else if constexpr (std::is_same_v<scalar_t, half>) {
         return reinterpret_cast<half*>(tensor.data_ptr<at::Half>());
     } else if constexpr (std::is_same_v<scalar_t, nv_bfloat16>) {
-        return reinterpret_cast<nv_bfloat16*>(tensor.data_ptr<nv_bfloat16>());
+        return reinterpret_cast<nv_bfloat16*>(tensor.data_ptr<at::BFloat16>());
     } else {
         return nullptr;
     }
@@ -65,7 +65,7 @@ void hogwild_attention_tpl(
     TORCH_CHECK_EQ(queries.size(2), Hq);
     TORCH_CHECK_EQ(queries.size(3), S);
     TORCH_CHECK(queries.is_contiguous());
-    const scalar_t* query_ptr = torch_get_pointer<const scalar_t>(queries);
+    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
 
     TORCH_CHECK_EQ(fragment_lengths.size(0), F);
     TORCH_CHECK(fragment_lengths.is_contiguous());
@@ -96,69 +96,15 @@ void hogwild_attention_tpl(
         TORCH_CHECK(key_fragments[f].is_contiguous());
         TORCH_CHECK(value_fragments[f].is_contiguous());
 
-        frag_ptrs_host[f] = torch_get_pointer<const scalar_t>(key_fragments[f]);
-        frag_ptrs_host[F + f] = torch_get_pointer<const scalar_t>(value_fragments[f]);
+        frag_ptrs_host[f] = torch_get_pointer<scalar_t>(key_fragments[f]);
+        frag_ptrs_host[F + f] = torch_get_pointer<scalar_t>(value_fragments[f]);
     }
 
     C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice, stream));
 
-    Shape shape = {F, W, Hq, Hkv, E, Ev, S, 0, 0, nullptr, nullptr}; // block_size, max_blocks not used
+    Shape shape = {F, W, Hq, Hkv, E, Ev, S, 0, 0}; // block_size, max_blocks not used
     C10_CUDA_CHECK(v21::hogwild_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
                           frag_ptrs, frag_ptrs + F, shape));
-}
-
-template<class scalar_t>
-void hogwild_varlen_paged_attention_tpl(at::Tensor& out,
-                                        double scale,
-                                        const at::Tensor& locations,
-                                        const at::Tensor& queries,
-                                        const at::Tensor& fragment_lengths,
-                                        const at::Tensor& key_cache,
-                                        const at::Tensor& value_cache,
-                                        const at::Tensor& block_table,
-                                        const at::Tensor& cu_seqlens_q,
-                                        const at::Tensor& cu_seqlens_k)
-{
-    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-
-    scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
-    const scalar_t* query_ptr = torch_get_pointer<const scalar_t>(queries);
-    const scalar_t* key_cache_ptr = torch_get_pointer<const scalar_t>(key_cache);
-    const scalar_t* value_cache_ptr = torch_get_pointer<const scalar_t>(value_cache);
-    const int* loc_ptr = locations.const_data_ptr<int>();
-    const int* fl_ptr = fragment_lengths.const_data_ptr<int>();
-    const int* block_table_ptr = block_table.const_data_ptr<int>();
-
-    // Varlen tensors validation
-    const int F = queries.size(0);
-    const int total_q = queries.size(1);
-    const int Hq = queries.size(2);
-    const int E = queries.size(3);
-
-    TORCH_CHECK_EQ(out.size(0), total_q);
-    TORCH_CHECK_EQ(out.size(1), Hq);
-    const int Ev = out.size(2);
-
-    TORCH_CHECK_EQ(locations.size(0), F);
-    TORCH_CHECK_EQ(locations.size(1), total_q);
-
-    Shape shape = {
-        F,                                  // F (num_fragments)
-        (int)cu_seqlens_q.size(0) - 1,      // W (batch_size)
-        Hq,                                 // Hq
-        (int)key_cache.size(1),             // Hkv
-        E,                                  // E
-        Ev,                                 // Ev
-        0,                                  // S (is variable)
-        (int)key_cache.size(2),             // block_size
-        (int)block_table.size(1),           // max_blocks_per_seq
-        cu_seqlens_q.const_data_ptr<int>(), // cu_seqlens_q
-        cu_seqlens_k.const_data_ptr<int>()  // cu_seqlens_k
-    };
-
-    C10_CUDA_CHECK(v21::hogwild_varlen_paged_attention_gpu<scalar_t>(
-        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
-        key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
 }
 
 template<class scalar_t>
@@ -170,9 +116,9 @@ void hogwild_paged_attention_tpl(
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
-    const scalar_t* query_ptr = torch_get_pointer<const scalar_t>(queries);
-    const scalar_t* key_cache_ptr = torch_get_pointer<const scalar_t>(key_cache);
-    const scalar_t* value_cache_ptr = torch_get_pointer<const scalar_t>(value_cache);
+    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
+    const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
+    const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
     const int* loc_ptr = locations.const_data_ptr<int>();
     const int* fl_ptr = fragment_lengths.const_data_ptr<int>();
     const int* block_table_ptr = block_table.const_data_ptr<int>();
@@ -186,8 +132,7 @@ void hogwild_paged_attention_tpl(
         (int)out.size(3),             // Ev
         (int)out.size(2),             // S
         (int)key_cache.size(2),       // block_size
-        (int)block_table.size(1),      // max_blocks_per_seq
-        nullptr, nullptr
+        (int)block_table.size(1)      // max_blocks_per_seq
     };
 
     C10_CUDA_CHECK(v21::hogwild_paged_attention_gpu<scalar_t>(
@@ -211,15 +156,15 @@ void copy_to_blocks_tpl(
     const int block_size = key_cache.size(2);
     const int max_blocks = block_table.size(1);
 
-    Shape shape = {0, B, 0, Hkv, E, Ev, S_new, block_size, max_blocks, nullptr, nullptr};
+    Shape shape = {0, B, 0, Hkv, E, Ev, S_new, block_size, max_blocks};
 
     dim3 grid_dim(B, Hkv);
     // Each thread handles one element in the embedding dimension
     dim3 block_dim(S_new, std::max(E, Ev));
 
     copy_to_blocks_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
-        torch_get_pointer<const scalar_t>(key_states),
-        torch_get_pointer<const scalar_t>(value_states),
+        torch_get_pointer<scalar_t>(key_states),
+        torch_get_pointer<scalar_t>(value_states),
         torch_get_pointer<scalar_t>(key_cache),
         torch_get_pointer<scalar_t>(value_cache),
         block_table.const_data_ptr<int>(),
@@ -261,8 +206,8 @@ void hogwild_rope_tpl(
     TORCH_CHECK_EQ(sines.size(2), S);
     TORCH_CHECK_EQ(sines.size(3), RotaryE);
 
-    rope_gpu(torch_get_pointer<scalar_t>(out), torch_get_pointer<const scalar_t>(queries),
-             torch_get_pointer<const float>(cosines), torch_get_pointer<const float>(sines),
+    rope_gpu(torch_get_pointer<scalar_t>(out), torch_get_pointer<scalar_t>(queries),
+             torch_get_pointer<float>(cosines), torch_get_pointer<float>(sines),
                      F, W, Hq, S, E, RotaryE);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -278,26 +223,6 @@ void hogwild_attention(
         hogwild_attention_tpl<float>(out, scale, locations, queries, fragment_lengths, key_fragments, value_fragments);
     } else if (out.dtype() == at::kBFloat16) {
         hogwild_attention_tpl<nv_bfloat16>(out, scale, locations, queries, fragment_lengths, key_fragments, value_fragments);
-    }
-}
-
-void hogwild_varlen_paged_attention(at::Tensor& out,
-                                    double scale,
-                                    const at::Tensor& locations,
-                                    const at::Tensor& queries,
-                                    const at::Tensor& fragment_lengths,
-                                    const at::Tensor& key_cache,
-                                    const at::Tensor& value_cache,
-                                    const at::Tensor& block_table,
-                                    const at::Tensor& cu_seqlens_q,
-                                    const at::Tensor& cu_seqlens_k)
-{
-    if(out.dtype() == at::kHalf) {
-        hogwild_varlen_paged_attention_tpl<half>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
-    } else if (out.dtype() == at::kFloat) {
-        hogwild_varlen_paged_attention_tpl<float>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
-    } else if (out.dtype() == at::kBFloat16) {
-        hogwild_varlen_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table, cu_seqlens_q, cu_seqlens_k);
     }
 }
 
@@ -388,9 +313,6 @@ TORCH_LIBRARY(libhogatt, m) {
 
     m.def("hogwild_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
           "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
-    m.def("hogwild_varlen_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
-          "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table, "
-          "Tensor cu_seqlens_q, Tensor cu_seqlens_k) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
     m.def("copy_to_blocks(Tensor key_states, Tensor value_states, Tensor(a!) key_cache, Tensor(b!) value_cache, "
           "Tensor block_table, Tensor seq_lengths) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
 
@@ -402,6 +324,5 @@ TORCH_LIBRARY_IMPL(libhogatt, CUDA, m) {
     m.impl("hogwild_fused", hogwild_fused);
 
     m.impl("hogwild_paged_sdpa", hogwild_paged_attention);
-    m.impl("hogwild_varlen_paged_sdpa", hogwild_varlen_paged_attention);
     m.impl("copy_to_blocks", copy_to_blocks);
 }
