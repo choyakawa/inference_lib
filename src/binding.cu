@@ -6,6 +6,7 @@
 #include <torch/library.h>
 #include <vector>
 
+#include "cache.cuh"
 #include "kernels/kernel_v21.cuh"
 #include "rope.cuh"
 
@@ -99,12 +100,78 @@ void hogwild_attention_tpl(
         frag_ptrs_host[F + f] = torch_get_pointer<scalar_t>(value_fragments[f]);
     }
 
-    C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice));
+    C10_CUDA_CHECK(cudaMemcpyAsync(frag_ptrs, frag_ptrs_host.data(), 2*sizeof(void*)*F, cudaMemcpyHostToDevice, stream));
 
-    // finally, launch
-    Shape shape = {F, W, Hq, Hkv, E, Ev, S};
+    Shape shape = {F, W, Hq, Hkv, E, Ev, S, 0, 0}; // block_size, max_blocks not used
     C10_CUDA_CHECK(v21::hogwild_attention_gpu(out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
                           frag_ptrs, frag_ptrs + F, shape));
+}
+
+template<class scalar_t>
+void hogwild_paged_attention_tpl(
+        at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
+        const at::Tensor& value_cache, const at::Tensor& block_table)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    scalar_t* out_ptr = torch_get_pointer<scalar_t>(out);
+    const scalar_t* query_ptr = torch_get_pointer<scalar_t>(queries);
+    const scalar_t* key_cache_ptr = torch_get_pointer<scalar_t>(key_cache);
+    const scalar_t* value_cache_ptr = torch_get_pointer<scalar_t>(value_cache);
+    const int* loc_ptr = locations.const_data_ptr<int>();
+    const int* fl_ptr = fragment_lengths.const_data_ptr<int>();
+    const int* block_table_ptr = block_table.const_data_ptr<int>();
+
+    Shape shape = {
+        (int)locations.size(0),       // F
+        (int)out.size(0),             // W (batch_size)
+        (int)out.size(1),             // Hq
+        (int)key_cache.size(1),       // Hkv
+        (int)queries.size(4),         // E
+        (int)out.size(3),             // Ev
+        (int)out.size(2),             // S
+        (int)key_cache.size(2),       // block_size
+        (int)block_table.size(1)      // max_blocks_per_seq
+    };
+
+    C10_CUDA_CHECK(v21::hogwild_paged_attention_gpu<scalar_t>(
+        out_ptr, (float)scale, loc_ptr, query_ptr, fl_ptr,
+        key_cache_ptr, value_cache_ptr, block_table_ptr, shape));
+}
+
+template<class scalar_t>
+void copy_to_blocks_tpl(
+    const at::Tensor& key_states, const at::Tensor& value_states,
+    at::Tensor& key_cache, at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lengths)
+{
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    const int B = key_states.size(0);
+    const int Hkv = key_states.size(1);
+    const int S_new = key_states.size(2);
+    const int E = key_states.size(3);
+    const int Ev = value_states.size(3);
+    const int block_size = key_cache.size(2);
+    const int max_blocks = block_table.size(1);
+
+    Shape shape = {0, B, 0, Hkv, E, Ev, S_new, block_size, max_blocks};
+
+    dim3 grid_dim(B, Hkv);
+    // Each thread handles one element in the embedding dimension
+    dim3 block_dim(S_new, std::max(E, Ev));
+
+    copy_to_blocks_kernel<scalar_t><<<grid_dim, block_dim, 0, stream>>>(
+        torch_get_pointer<scalar_t>(key_states),
+        torch_get_pointer<scalar_t>(value_states),
+        torch_get_pointer<scalar_t>(key_cache),
+        torch_get_pointer<scalar_t>(value_cache),
+        block_table.const_data_ptr<int>(),
+        seq_lengths.const_data_ptr<int>(),
+        shape
+    );
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 template<class scalar_t>
@@ -159,6 +226,20 @@ void hogwild_attention(
     }
 }
 
+void hogwild_paged_attention(
+        at::Tensor& out, double scale, const at::Tensor& locations, const at::Tensor& queries,
+        const at::Tensor& fragment_lengths, const at::Tensor& key_cache,
+        const at::Tensor& value_cache, const at::Tensor& block_table)
+{
+    if(out.dtype() == at::kHalf) {
+        hogwild_paged_attention_tpl<half>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+    } else if (out.dtype() == at::kFloat) {
+        hogwild_paged_attention_tpl<float>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+    } else if (out.dtype() == at::kBFloat16) {
+        hogwild_paged_attention_tpl<nv_bfloat16>(out, scale, locations, queries, fragment_lengths, key_cache, value_cache, block_table);
+    }
+}
+
 void hogwild_rope(
         at::Tensor& out, const at::Tensor& queries, const at::Tensor& cosines, const at::Tensor& sines)
 {
@@ -168,6 +249,20 @@ void hogwild_rope(
         hogwild_rope_tpl<float>(out, queries, cosines, sines);
     } else if (out.dtype() == at::kBFloat16) {
         hogwild_rope_tpl<nv_bfloat16>(out, queries, cosines, sines);
+    }
+}
+
+void copy_to_blocks(
+    const at::Tensor& key_states, const at::Tensor& value_states,
+    at::Tensor& key_cache, at::Tensor& value_cache,
+    const at::Tensor& block_table, const at::Tensor& seq_lengths)
+{
+    if(key_states.dtype() == at::kHalf) {
+        copy_to_blocks_tpl<half>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
+    } else if (key_states.dtype() == at::kFloat) {
+        copy_to_blocks_tpl<float>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
+    } else if (key_states.dtype() == at::kBFloat16) {
+        copy_to_blocks_tpl<nv_bfloat16>(key_states, value_states, key_cache, value_cache, block_table, seq_lengths);
     }
 }
 
@@ -215,10 +310,19 @@ TORCH_LIBRARY(libhogatt, m) {
     m.def("hogwild_rope(Tensor(a!) output, Tensor queries, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
     m.def("hogwild_fused(Tensor(a!) output, Tensor(b!) rq, float scale, Tensor locations, Tensor queries, "
           "Tensor fragment_lengths, Tensor[] key_fragments, Tensor[] value_fragments, Tensor cosines, Tensor sines) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
+
+    m.def("hogwild_paged_sdpa(Tensor(a!) output, float scale, Tensor locations, Tensor queries, "
+          "Tensor fragment_lengths, Tensor key_cache, Tensor value_cache, Tensor block_table) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
+    m.def("copy_to_blocks(Tensor key_states, Tensor value_states, Tensor(a!) key_cache, Tensor(b!) value_cache, "
+          "Tensor block_table, Tensor seq_lengths) -> ()", tags, torch::_RegisterOrVerify::REGISTER);
+
 }
 
 TORCH_LIBRARY_IMPL(libhogatt, CUDA, m) {
     m.impl("hogwild_sdpa", hogwild_attention);
     m.impl("hogwild_rope", hogwild_rope);
     m.impl("hogwild_fused", hogwild_fused);
+
+    m.impl("hogwild_paged_sdpa", hogwild_paged_attention);
+    m.impl("copy_to_blocks", copy_to_blocks);
 }
